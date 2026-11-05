@@ -80,7 +80,11 @@ impl WordApp {
             }
             let fill = if screen == chrome::Screen::Focus { chrome::FOCUS_CANVAS } else { t.canvas };
             egui::CentralPanel::default().frame(egui::Frame::NONE.fill(fill)).show(ui, |ui| {
-                canvas::show(self, ui);
+                if self.session.md_source.is_some() {
+                    crate::md_source::show(self, ui);
+                } else {
+                    canvas::show(self, ui);
+                }
             });
             if self.focus_ribbon && !moved(self) {
                 chrome::focus_ribbon(self, ctx);

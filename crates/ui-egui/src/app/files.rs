@@ -288,12 +288,15 @@ impl WordApp {
         self.default_save_name()
     }
 
-    /// The name Save suggests: the open file's own Word format (so a .docm keeps its macros),
-    /// otherwise .docx.
+    /// The name Save suggests: the open file's own Word format (so a .docm keeps its macros) or,
+    /// in a dialog, its own Markdown format (a browser's download keeps the whole document as
+    /// .docx), otherwise .docx.
     pub(crate) fn default_save_name(&self) -> String {
         let ext = self.session.path.as_ref().and_then(|p| p.extension()).map(|e| e.to_string_lossy().to_string());
+        let markdown =
+            self.services.download.is_none() && self.session.path.as_deref().is_some_and(wordcraft_engine::cmd::md_source::is_markdown_file);
         match ext {
-            Some(e) if wordcraft_engine::io::is_word_package(&e) => format!("{}.{e}", self.title_stem()),
+            Some(e) if markdown || wordcraft_engine::io::is_word_package(&e) => format!("{}.{e}", self.title_stem()),
             _ => format!("{}.docx", self.title_stem()),
         }
     }

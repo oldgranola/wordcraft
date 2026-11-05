@@ -1,0 +1,486 @@
+//! View › Markdown Source: a Markdown file's document as editable text.
+//!
+//! The document holds no Markdown while it is edited, so entering writes it out as text, and the
+//! text waits beside the document ([`MdSource`]) while it is edited. Leaving reads a changed text
+//! back into a new document; one Undo takes back the whole visit. A visit that changes nothing
+//! leaves the document as it was, whatever Markdown can't represent.
+//!
+//! While the text is open it is the document: commands that edit the document are refused, those
+//! that read it (Save, Export) first get the text applied, and those that change the view leave.
+
+use serde_json::{Value, json};
+use wordcraft_doc::{Document, Path, Pos, StoryRef};
+
+use crate::doc_state::Selection;
+use crate::{CmdError, CmdResult, CommandSpec, Session, p};
+
+/// The largest text the view takes, in bytes: its text box lays all of it out after each edit.
+pub const MAX_SOURCE_BYTES: usize = 2 * 1024 * 1024;
+
+const LABEL: &str = "Markdown Source";
+
+/// The text of an open Markdown Source view.
+#[derive(Clone)]
+pub struct MdSource {
+    /// What the view shows and edits.
+    pub text: String,
+    /// The caret in `text`, in characters. The front end keeps it current.
+    pub caret: usize,
+    /// The front end still has to put its caret at `caret` and show it.
+    pub place_caret: bool,
+    /// Markdown can't represent all of the document: applying a changed text loses something.
+    pub loses_content: bool,
+    /// When the front end last applied the text while it was being typed, on its own clock.
+    pub applied_at_ms: f64,
+    /// The text on entry.
+    entry_text: String,
+    /// The document on entry, which that text stands for: back to it, nothing is lost.
+    entry_doc: Document,
+    /// The text the document now holds.
+    applied: String,
+    /// The visit has its undo step.
+    has_step: bool,
+}
+
+impl MdSource {
+    /// The text holds edits the document doesn't have yet.
+    pub fn is_pending(&self) -> bool {
+        self.text != self.applied
+    }
+}
+
+pub fn specs() -> Vec<CommandSpec> {
+    vec![
+        // Not `pure`: leaving edits the document. Entering changes nothing, so it adds no undo step.
+        CommandSpec::new(TOGGLE, LABEL, "View › Views", toggle).params(r#"{"value"?: bool}"#).when(can_toggle),
+        CommandSpec::new(TEXT, "Markdown Source Text", "View › Views", text)
+            .params(r#"{"text"?: string, "caret"?: number}"#)
+            .when(|s| s.md_source.is_none().then_some("only in Markdown Source"))
+            .pure(),
+    ]
+}
+
+const TOGGLE: &str = "view.markdownSource";
+const TEXT: &str = "view.markdownSourceText";
+/// The views that replace this one: they show the document, so the text goes into it first.
+const LEAVES: [&str; 5] = ["view.printLayout", "view.webLayout", "view.draft", "view.outline", "view.readMode"];
+
+/// Whether a file's name says it is Markdown.
+pub fn is_markdown_file(path: &std::path::Path) -> bool {
+    path.extension().and_then(std::ffi::OsStr::to_str).is_some_and(|e| e.eq_ignore_ascii_case("md") || e.eq_ignore_ascii_case("markdown"))
+}
+
+fn is_markdown_path(s: &Session) -> bool {
+    s.path.as_deref().is_some_and(is_markdown_file)
+}
+
+fn can_toggle(s: &Session) -> Option<&'static str> {
+    if s.md_source.is_some() {
+        None
+    } else if !is_markdown_path(s) {
+        Some("only for Markdown (.md) files")
+    } else if s.view.read_mode {
+        Some("not in Read Mode")
+    } else if s.doc.settings.track_changes || !s.doc.revisions.is_empty() {
+        Some("not with tracked changes")
+    } else if s.doc.settings.protection.is_some() {
+        Some("not in a protected document")
+    } else {
+        None
+    }
+}
+
+fn toggle(s: &mut Session, v: &Value) -> CmdResult {
+    let on = p::bool(v, "value").unwrap_or(s.md_source.is_none());
+    match (on, s.md_source.is_some()) {
+        (true, false) => enter(s)?,
+        (false, true) => leave(s),
+        _ => {}
+    }
+    Ok(json!({"value": s.md_source.is_some()}))
+}
+
+fn text(s: &mut Session, v: &Value) -> CmdResult {
+    let new_text = p::str(v, "text");
+    if new_text.is_some_and(|t| t.len() > MAX_SOURCE_BYTES) {
+        return Err(CmdError::Params(too_long()));
+    }
+    let Some(src) = s.md_source.as_mut() else { return Err(CmdError::Disabled("only in Markdown Source".into())) };
+    let mut edited = false;
+    if let Some(t) = new_text {
+        edited = src.text != t;
+        src.text = t.to_string();
+        src.caret = src.caret.min(src.text.chars().count());
+    }
+    if let Some(caret) = v.get("caret").and_then(Value::as_u64) {
+        src.caret = usize::try_from(caret).unwrap_or(usize::MAX).min(src.text.chars().count());
+    }
+    let result = json!({"text": src.text, "caret": src.caret, "losesContent": src.loses_content});
+    if edited {
+        s.dirty = true;
+    }
+    Ok(result)
+}
+
+fn too_long() -> String {
+    format!("Markdown Source takes up to {} MB of text", MAX_SOURCE_BYTES / (1024 * 1024))
+}
+
+fn enter(s: &mut Session) -> Result<(), CmdError> {
+    let text = wordcraft_formats::markdown::export(&s.doc);
+    if text.len() > MAX_SOURCE_BYTES {
+        return Err(CmdError::Failed(too_long()));
+    }
+    let loses_content = !parse(&s.doc, &text).same_content(&s.doc);
+    let caret = line_start_char(&text, line_of_block(&s.doc, s.sel.focus.path.0.first().copied().unwrap_or(0) as usize, s.sel.focus.story));
+    s.md_source = Some(MdSource {
+        caret,
+        place_caret: true,
+        loses_content,
+        applied_at_ms: 0.0,
+        entry_doc: s.doc.clone(),
+        entry_text: text.clone(),
+        applied: text.clone(),
+        text,
+        has_step: false,
+    });
+    Ok(())
+}
+
+fn leave(s: &mut Session) {
+    // `Session::run` took a step for this command: the visit's first, or one too many.
+    let had_step = s.md_source.as_ref().is_some_and(|src| src.has_step);
+    if had_step {
+        s.drop_last_undo_step();
+    }
+    if let Some(src) = s.md_source.as_mut() {
+        src.has_step = true;
+    }
+    apply(s);
+    if let Some(src) = s.md_source.take()
+        && (had_step || src.text != src.entry_text)
+    {
+        let block = block_of_caret(&src.text, src.caret, &s.doc);
+        s.sel = Selection::caret(block);
+    }
+}
+
+/// The text into the document, if it has edits the document lacks. Its first change in a visit
+/// takes the visit's undo step. Save, AutoSave and crash recovery see the text this way.
+pub fn apply(s: &mut Session) {
+    let Some(src) = s.md_source.as_ref().filter(|src| src.is_pending()) else { return };
+    let doc = if src.text == src.entry_text { src.entry_doc.clone() } else { parse(&s.doc, &src.text) };
+    let (text, has_step) = (src.text.clone(), src.has_step);
+    if !has_step {
+        s.checkpoint(LABEL);
+    }
+    s.doc = doc;
+    s.note_body_replaced();
+    s.math = None;
+    s.touch();
+    s.clamp_selection();
+    if let Some(src) = s.md_source.as_mut() {
+        src.applied = text;
+        src.has_step = true;
+    }
+}
+
+/// `text` as a document, with what isn't in Markdown from `current`: its page, settings,
+/// properties and language, as opening the file gave it.
+fn parse(current: &Document, text: &str) -> Document {
+    let mut doc = wordcraft_formats::markdown::import_on(text, &current.last_section);
+    doc.ensure_nonempty();
+    doc.settings = current.settings.clone();
+    doc.core = current.core.clone();
+    doc.styles.default_chr.lang = current.styles.default_chr.lang.clone();
+    doc
+}
+
+/// The line of `text` that the document's top-level block `block` starts on: its text is what
+/// comes after the blocks before it.
+fn line_of_block(doc: &Document, block: usize, story: StoryRef) -> usize {
+    if block == 0 || story != StoryRef::Body {
+        return 0;
+    }
+    let mut before = doc.clone();
+    before.body.truncate(block);
+    // A blank line separates the blocks.
+    wordcraft_formats::markdown::export(&before).lines().count().saturating_add(1)
+}
+
+/// The character where `line` starts, or the end of a text with fewer lines.
+fn line_start_char(text: &str, line: usize) -> usize {
+    if line == 0 {
+        return 0;
+    }
+    let mut lines = 0;
+    for (i, c) in text.chars().enumerate() {
+        if c == '\n' {
+            lines += 1;
+            if lines == line {
+                return i.saturating_add(1);
+            }
+        }
+    }
+    text.chars().count()
+}
+
+/// Where the caret at character `caret` of `text` lands in `doc`, read from that text: at the
+/// start of the top-level block its line belongs to.
+fn block_of_caret(text: &str, caret: usize, doc: &Document) -> Pos {
+    let end = text.char_indices().nth(caret).map_or(text.len(), |(i, _)| i);
+    let head = text.get(..end).unwrap_or(text);
+    // The caret's line whole, so a block it is at the start of counts.
+    let line_end = text.get(end..).and_then(|rest| rest.find('\n')).map_or(text.len(), |n| end.saturating_add(n));
+    let before = text.get(..line_end).unwrap_or(head);
+    let blocks = wordcraft_formats::markdown::import(before).body.len();
+    let top = blocks.saturating_sub(1).min(doc.body.len().saturating_sub(1));
+    let top = u32::try_from(top).unwrap_or(0);
+    let path = doc.para_paths(StoryRef::Body).into_iter().find(|path| path.0.first().is_some_and(|b| *b >= top));
+    match path {
+        Some(path) => Pos { story: StoryRef::Body, path, off: 0 },
+        None => Pos { story: StoryRef::Body, path: Path::top(0), off: 0 },
+    }
+}
+
+/// Why the open text refuses command `id`, if it does.
+pub(crate) fn refusal(s: &Session, id: &str, mutates: bool) -> Option<&'static str> {
+    (s.md_source.is_some()
+        && id != TOGGLE
+        && !LEAVES.contains(&id)
+        && (mutates || matches!(id, "edit.undo" | "edit.undoTo" | "edit.redo" | "edit.repeat")))
+    .then_some("leave Markdown Source first")
+}
+
+/// What a command does while the text is open, before it runs (see the module's header).
+pub(crate) fn before_command(s: &mut Session, id: &str, mutates: bool) -> Result<(), CmdError> {
+    if s.md_source.is_none() || id == TOGGLE || id == TEXT {
+        return Ok(());
+    }
+    if LEAVES.contains(&id) {
+        s.run(TOGGLE, &json!({"value": false}))?;
+    } else if let Some(why) = refusal(s, id, mutates) {
+        return Err(CmdError::Disabled(format!("{id}: {why}")));
+    } else if !id.starts_with("caret.") && !id.starts_with("select.") && !id.starts_with("view.") {
+        apply(s);
+    }
+    Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::path::PathBuf;
+    use wordcraft_layout::ViewMode;
+
+    const SAMPLE: &str = "# Title\n\nFirst paragraph.\n\n## Second\n\n- one\n- two\n\nLast **bold** paragraph.\n";
+
+    fn session(md: &str) -> Session {
+        let mut s = Session::new(crate::io::open_bytes("a.md", md.as_bytes()).unwrap());
+        s.path = Some(PathBuf::from("/tmp/wordcraft-md-source-test.md"));
+        s.dirty = false;
+        s
+    }
+
+    fn set_text(s: &mut Session, text: &str) {
+        s.run(TEXT, &json!({"text": text})).unwrap();
+    }
+
+    fn body_text(s: &Session) -> String {
+        s.doc.plain_text(StoryRef::Body)
+    }
+
+    #[test]
+    fn a_visit_that_changes_nothing_is_no_edit() {
+        let mut s = session(SAMPLE);
+        let before = s.doc.clone();
+        let depth = s.undo_depth();
+        s.run(TOGGLE, &json!({})).unwrap();
+        assert!(s.md_source.is_some());
+        assert!(!s.dirty, "entering is not an edit");
+        s.run(TOGGLE, &json!({})).unwrap();
+        assert!(s.md_source.is_none());
+        assert!(s.doc.same_content(&before));
+        assert!(!s.dirty, "a visit without edits leaves no unsaved changes");
+        assert_eq!(s.undo_depth(), depth, "and no undo step");
+    }
+
+    #[test]
+    fn an_edited_text_becomes_the_document_and_one_undo_takes_it_back() {
+        let mut s = session(SAMPLE);
+        let before = s.doc.clone();
+        s.run(TOGGLE, &json!({})).unwrap();
+        let text = s.run(TEXT, &json!({})).unwrap()["text"].as_str().unwrap().to_string();
+        assert!(text.starts_with("# Title"), "{text}");
+        set_text(&mut s, &text.replace("First paragraph.", "Changed paragraph."));
+        assert!(s.dirty, "the edit is an unsaved change");
+        s.run(TOGGLE, &json!({})).unwrap();
+        assert!(body_text(&s).contains("Changed paragraph."));
+        s.run("edit.undo", &json!({})).unwrap();
+        assert!(s.doc.same_content(&before), "one undo restores the document");
+        assert!(s.can_redo());
+    }
+
+    #[test]
+    fn save_writes_the_text_and_the_visit_stays_one_undo_step() {
+        let dir = std::env::temp_dir().join(format!("wordcraft-md-source-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("saved.md");
+        let mut s = session(SAMPLE);
+        s.path = Some(path.clone());
+        let before = s.doc.clone();
+        let depth = s.undo_depth();
+        s.run(TOGGLE, &json!({})).unwrap();
+        set_text(&mut s, "# Saved one\n");
+        s.run("file.save", &json!({})).unwrap();
+        assert!(std::fs::read_to_string(&path).unwrap().contains("Saved one"));
+        assert!(!s.dirty);
+        assert!(s.md_source.is_some(), "saving keeps the view open");
+        set_text(&mut s, "# Saved two\n");
+        s.run("file.save", &json!({})).unwrap();
+        assert!(std::fs::read_to_string(&path).unwrap().contains("Saved two"));
+        set_text(&mut s, "# Left three\n");
+        s.run(TOGGLE, &json!({})).unwrap();
+        assert!(body_text(&s).contains("Left three"));
+        assert_eq!(s.undo_depth(), depth + 1, "one step for the whole visit");
+        s.run("edit.undo", &json!({})).unwrap();
+        assert!(s.doc.same_content(&before));
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn going_back_to_the_entry_text_restores_what_markdown_cannot_hold() {
+        let mut s = session(SAMPLE);
+        s.doc.styles.get_mut("Normal").unwrap().chr.bold = Some(true);
+        let before = s.doc.clone();
+        s.run(TOGGLE, &json!({})).unwrap();
+        assert!(s.md_source.as_ref().unwrap().loses_content, "Markdown doesn't keep a changed style");
+        let text = s.md_source.as_ref().unwrap().text.clone();
+        set_text(&mut s, "# Other\n");
+        apply(&mut s);
+        assert!(!s.doc.same_content(&before));
+        set_text(&mut s, &text);
+        s.run(TOGGLE, &json!({})).unwrap();
+        assert!(s.doc.same_content(&before));
+    }
+
+    #[test]
+    fn markdown_the_document_came_from_is_not_reported_as_lost() {
+        let s = &mut session(SAMPLE);
+        s.run(TOGGLE, &json!({})).unwrap();
+        assert!(!s.md_source.as_ref().unwrap().loses_content);
+    }
+
+    #[test]
+    fn edits_are_refused_while_the_text_is_open_and_nothing_is_lost() {
+        let mut s = session(SAMPLE);
+        let before = s.doc.clone();
+        s.run(TOGGLE, &json!({})).unwrap();
+        set_text(&mut s, "# Kept\n");
+        for id in ["format.bold", "edit.undo", "edit.redo"] {
+            assert!(matches!(s.run(id, &json!({})), Err(CmdError::Disabled(_))), "{id}");
+        }
+        assert!(matches!(s.run("text.insert", &json!({"text": "x"})), Err(CmdError::Disabled(_))));
+        assert!(s.doc.same_content(&before));
+        assert_eq!(s.md_source.as_ref().unwrap().text, "# Kept\n");
+    }
+
+    #[test]
+    fn changing_the_view_leaves_with_the_edits() {
+        let mut s = session(SAMPLE);
+        s.run(TOGGLE, &json!({})).unwrap();
+        set_text(&mut s, "# Applied\n");
+        s.run("view.webLayout", &json!({})).unwrap();
+        assert!(s.md_source.is_none());
+        assert!(body_text(&s).contains("Applied"));
+        assert_eq!(s.view.mode, ViewMode::Web);
+    }
+
+    #[test]
+    fn only_markdown_files_without_tracking_or_protection_enter() {
+        let mut s = Session::new(Document::from_text("Text"));
+        assert!(s.run(TOGGLE, &json!({})).is_err(), "no file");
+        s.path = Some(PathBuf::from("/tmp/a.docx"));
+        assert!(s.run(TOGGLE, &json!({})).is_err(), "not Markdown");
+        s.path = Some(PathBuf::from("/tmp/A.MARKDOWN"));
+        s.doc.settings.track_changes = true;
+        assert!(s.run(TOGGLE, &json!({})).is_err(), "tracking");
+        s.doc.settings.track_changes = false;
+        s.doc.settings.protection = Some("readOnly".into());
+        assert!(s.run(TOGGLE, &json!({})).is_err(), "protected");
+        s.doc.settings.protection = None;
+        s.view.read_mode = true;
+        assert!(s.run(TOGGLE, &json!({})).is_err(), "Read Mode");
+        s.view.read_mode = false;
+        s.run(TOGGLE, &json!({})).unwrap();
+    }
+
+    #[test]
+    fn a_text_too_long_is_refused() {
+        let mut s = session(SAMPLE);
+        s.run(TOGGLE, &json!({})).unwrap();
+        let long = "x".repeat(MAX_SOURCE_BYTES + 1);
+        assert!(matches!(s.run(TEXT, &json!({"text": long})), Err(CmdError::Params(_))));
+        s.run(TOGGLE, &json!({})).unwrap();
+        s.set_document(Document::from_text(&"x".repeat(MAX_SOURCE_BYTES + 1)));
+        s.path = Some(PathBuf::from("/tmp/a.md"));
+        assert!(s.run(TOGGLE, &json!({})).is_err());
+        assert!(s.md_source.is_none());
+    }
+
+    #[test]
+    fn the_caret_stays_with_its_paragraph_both_ways() {
+        let mut s = session(SAMPLE);
+        let target = s
+            .doc
+            .para_paths(StoryRef::Body)
+            .into_iter()
+            .find(|path| s.doc.para(StoryRef::Body, path).is_some_and(|para| para.plain_text().contains("Last")))
+            .unwrap();
+        s.sel = Selection::caret(Pos { story: StoryRef::Body, path: target.clone(), off: 2 });
+        s.run(TOGGLE, &json!({})).unwrap();
+        let src = s.md_source.as_ref().unwrap();
+        let line: String = src.text.chars().skip(src.caret).take_while(|c| *c != '\n').collect();
+        assert!(line.contains("Last"), "caret on {line:?} in {:?}", src.text);
+        let changed = src.text.replace("First paragraph.", "First changed paragraph.");
+        let caret = changed.chars().collect::<String>().find("Last").map(|byte| changed[..byte].chars().count()).unwrap();
+        s.run(TEXT, &json!({"text": changed, "caret": caret})).unwrap();
+        s.run(TOGGLE, &json!({})).unwrap();
+        let para = s.doc.para(StoryRef::Body, &s.sel.focus.path).unwrap();
+        assert!(para.plain_text().contains("Last"), "{:?}", para.plain_text());
+    }
+
+    #[test]
+    fn hostile_carets_and_texts_do_not_panic() {
+        let mut s = session(SAMPLE);
+        s.run(TOGGLE, &json!({})).unwrap();
+        for (text, caret) in [("", u64::MAX), ("é\n\n\n", 2), ("```\nopen fence", 9), ("|\n|-", 1), ("> > > >\n- - - -", 3)] {
+            s.run(TEXT, &json!({"text": text, "caret": caret})).unwrap();
+            s.run(TOGGLE, &json!({})).unwrap();
+            s.clamp_selection();
+            assert!(s.doc.para(s.sel.focus.story, &s.sel.focus.path).is_some(), "{text:?}");
+            s.run(TOGGLE, &json!({})).unwrap();
+        }
+    }
+
+    #[test]
+    fn a_parked_document_keeps_its_text() {
+        let mut s = session(SAMPLE);
+        s.run(TOGGLE, &json!({})).unwrap();
+        set_text(&mut s, "# Mine\n");
+        let first = s.document_id();
+        let second = s.add_opened_document(Document::from_text("Other"));
+        s.activate(second).unwrap();
+        assert!(s.md_source.is_none(), "the other document has no text open");
+        s.activate(first).unwrap();
+        assert_eq!(s.md_source.as_ref().unwrap().text, "# Mine\n");
+    }
+
+    #[test]
+    fn opening_over_the_document_closes_the_view() {
+        let mut s = session(SAMPLE);
+        s.run(TOGGLE, &json!({})).unwrap();
+        s.set_document(Document::from_text("New"));
+        assert!(s.md_source.is_none());
+    }
+}

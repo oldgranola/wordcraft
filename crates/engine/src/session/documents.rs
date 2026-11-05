@@ -70,6 +70,7 @@ pub struct DocState {
     pub(super) layout: LayoutSlots,
     pub(super) typing: Option<TypedWord>,
     pub(super) originals: std::collections::HashMap<String, String>,
+    pub(super) md_source: Option<crate::cmd::md_source::MdSource>,
     pub(super) picture_looks: std::collections::HashMap<String, crate::cmd::objects::PictureLook>,
     pub(super) versions: Vec<(String, String, Document)>,
     pub(super) autosave: bool,
@@ -124,6 +125,7 @@ impl DocState {
             layout: Default::default(),
             typing: None,
             originals: Default::default(),
+            md_source: None,
             picture_looks: Default::default(),
             versions: Vec::new(),
             autosave: true,
@@ -224,6 +226,7 @@ impl Session {
             layout: _,
             typing: _,
             originals: _,
+            md_source: _,
             picture_looks: _,
             versions: _,
             autosave: _,
@@ -313,6 +316,7 @@ impl Session {
             layout,
             typing,
             originals,
+            md_source,
             picture_looks,
             versions,
             autosave,
@@ -360,6 +364,7 @@ impl Session {
         swap(&mut self.layout, layout);
         swap(&mut self.typing, typing);
         swap(&mut self.originals, originals);
+        swap(&mut self.md_source, md_source);
         swap(&mut self.picture_looks, picture_looks);
         swap(&mut self.versions, versions);
         swap(&mut self.autosave, autosave);

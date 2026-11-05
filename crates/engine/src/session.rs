@@ -161,6 +161,8 @@ pub struct Session {
     typing: Option<TypedWord>,
     /// Picture edits: edited media key → original media key (Reset Picture).
     pub originals: std::collections::HashMap<String, String>,
+    /// View › Markdown Source: its text, while it is open.
+    pub md_source: Option<crate::cmd::md_source::MdSource>,
     /// Picture effects, styles and borders: drawn media key → what was drawn on which bitmap,
     /// so the next one replaces them instead of drawing over them (#2052).
     pub picture_looks: std::collections::HashMap<String, crate::cmd::objects::PictureLook>,

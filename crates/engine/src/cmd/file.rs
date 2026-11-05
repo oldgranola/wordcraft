@@ -379,8 +379,10 @@ fn save(s: &mut Session, v: &Value) -> CmdResult {
     let encrypted = password.is_some() && crate::io::can_encrypt(&path.to_string_lossy());
     // A save in a format that doesn't keep everything (plain text, Markdown, a page image) is a
     // copy, except over the document's own file: a note.txt opened and saved is saved (#2376).
+    // A Markdown file saved as another one loses nothing its own save wouldn't: it moves there.
     let own_file = s.path.as_deref() == Some(path.as_path());
-    if own_file || ["docx", "docm", "dotx", "dotm", "odt", "rtf", "json", "xml"].contains(&ext.as_str()) {
+    let markdown_to_markdown = super::md_source::is_markdown_file(&path) && s.path.as_deref().is_some_and(super::md_source::is_markdown_file);
+    if own_file || markdown_to_markdown || ["docx", "docm", "dotx", "dotm", "odt", "rtf", "json", "xml"].contains(&ext.as_str()) {
         s.path = Some(path.clone());
         s.dirty = false;
         s.relayout();
