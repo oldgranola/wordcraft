@@ -251,7 +251,7 @@ fn parse(current: &Document, text: &str) -> Document {
     doc.ensure_nonempty();
     doc.settings = current.settings.clone();
     doc.core = current.core.clone();
-    doc.styles.default_chr.lang = current.styles.default_chr.lang.clone();
+    std::sync::Arc::make_mut(&mut doc.styles).default_chr.lang = current.styles.default_chr.lang.clone();
     doc
 }
 
@@ -419,7 +419,7 @@ mod tests {
     #[test]
     fn going_back_to_the_entry_text_restores_what_markdown_cannot_hold() {
         let mut s = session(SAMPLE);
-        s.doc.styles.get_mut("Normal").unwrap().chr.bold = Some(true);
+        std::sync::Arc::make_mut(&mut s.doc.styles).get_mut("Normal").unwrap().chr.bold = Some(true);
         let before = s.doc.clone();
         s.run(TOGGLE, &json!({})).unwrap();
         assert!(s.md_source.as_ref().unwrap().loses_content, "Markdown doesn't keep a changed style");

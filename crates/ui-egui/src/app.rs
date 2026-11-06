@@ -56,6 +56,7 @@ impl WordApp {
             seen_full_screen,
             escape_free,
             word_count,
+            missing_fonts,
             last_autosave,
             equation_prev_tab,
             smart_art_item,
@@ -170,6 +171,7 @@ impl WordApp {
             seen_full_screen,
             escape_free,
             word_count,
+            missing_fonts,
             last_autosave,
             equation_prev_tab,
             smart_art_item,
@@ -214,6 +216,12 @@ impl WordApp {
         self.no_document != Some(self.session.document_id())
     }
 
+    /// Whether a modal dialog is open: the rest of the window takes no clicks, keys or
+    /// shortcuts until it closes (#3859).
+    pub(crate) fn modal_open(&self) -> bool {
+        self.file_browser_open() || self.dialog.as_ref().is_some_and(crate::dialogs::Dialog::is_modal) || self.colors.is_some()
+    }
+
     /// Terminal feedback also reaches the normal window when printing starts through control.
     pub fn poll_printing(&mut self, ctx: &egui::Context) {
         self.printing.poll(ctx);
@@ -222,6 +230,9 @@ impl WordApp {
 
     /// Per-frame logic before layout: control requests, screenshots, shortcuts, file drops.
     pub fn logic(&mut self, ctx: &egui::Context) {
+        // #2726: egui's AccessKit update must carry the focused node in its node list; a frame
+        // that drops it panics in `accesskit_consumer` and closes the window (see `a11y::FocusGuard`).
+        ctx.add_plugin(super::a11y::FocusGuard);
         updates_ui::tick(self, ctx);
         crate::language_packs::tick(self);
         let lang = i18n::Lang::from_pref(&self.ui.language);
