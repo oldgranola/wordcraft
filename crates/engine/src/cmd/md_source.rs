@@ -7,6 +7,10 @@
 //!
 //! While the text is open it is the document: commands that edit the document are refused, those
 //! that read it (Save, Export) first get the text applied, and those that change the view leave.
+//!
+//! The file's own text is kept beside the document too ([`FileText`]): while it still stands for
+//! the document, the view shows it and Save writes it, unchanged. An edit in the formatted view
+//! makes the document something only writing it out again can say.
 
 use serde_json::{Value, json};
 use wordcraft_doc::{Document, Path, Pos, StoryRef};
@@ -47,6 +51,52 @@ impl MdSource {
     pub fn is_pending(&self) -> bool {
         self.text != self.applied
     }
+}
+
+/// A Markdown file's own text, which keeps what the document can't (front matter, comments, a
+/// code block's language, the author's own spacing): the text the file was opened or last saved
+/// with, and the last text the view applied. Either stands for the document while reading it
+/// gives the document as it is, so an Undo back to either finds it again.
+#[derive(Clone, Default)]
+pub struct FileText {
+    saved: Option<String>,
+    latest: Option<String>,
+}
+
+impl FileText {
+    /// A file's bytes as its text, if they can be written back as they are: UTF-8 without a byte
+    /// order mark, not empty, and no longer than the view takes.
+    pub fn from_bytes(bytes: &[u8]) -> Self {
+        let keep = !bytes.is_empty() && bytes.len() <= MAX_SOURCE_BYTES && !bytes.starts_with(b"\xEF\xBB\xBF");
+        let saved = keep.then(|| std::str::from_utf8(bytes).ok()).flatten().map(str::to_string);
+        Self { saved, latest: None }
+    }
+
+    /// The text just written to the file, which is the file's own text now.
+    pub fn saved(text: Option<String>) -> Self {
+        Self { saved: text, latest: None }
+    }
+
+    /// No text is kept.
+    pub fn is_empty(&self) -> bool {
+        self.saved.is_none() && self.latest.is_none()
+    }
+}
+
+/// The kept text that stands for the document as it is, if one does: the latest first.
+fn exact_text(s: &Session) -> Option<String> {
+    let kept = [s.md_file.latest.as_deref(), s.md_file.saved.as_deref()];
+    kept.into_iter().flatten().find(|text| parse(&s.doc, text).same_content(&s.doc)).map(str::to_string)
+}
+
+/// What Save writes to the Markdown file `path`, in place of the document written out again: the
+/// file's own text, while it stands for the document. Not for a Print Markup copy, which adds
+/// the comments.
+pub(crate) fn text_to_save(s: &Session, path: &std::path::Path, markup: bool) -> Option<String> {
+    if markup || !is_markdown_file(path) {
+        return None;
+    }
+    exact_text(s)
 }
 
 pub fn specs() -> Vec<CommandSpec> {
@@ -127,12 +177,20 @@ fn too_long() -> String {
 }
 
 fn enter(s: &mut Session) -> Result<(), CmdError> {
-    let text = wordcraft_formats::markdown::export(&s.doc);
-    if text.len() > MAX_SOURCE_BYTES {
-        return Err(CmdError::Failed(too_long()));
-    }
-    let loses_content = !parse(&s.doc, &text).same_content(&s.doc);
-    let caret = line_start_char(&text, line_of_block(&s.doc, s.sel.focus.path.0.first().copied().unwrap_or(0) as usize, s.sel.focus.story));
+    // The file's own text when it still says what the document holds, so nothing is lost.
+    let (text, loses_content) = match exact_text(s) {
+        Some(text) => (text, false),
+        None => {
+            let text = wordcraft_formats::markdown::export(&s.doc);
+            if text.len() > MAX_SOURCE_BYTES {
+                return Err(CmdError::Failed(too_long()));
+            }
+            let loses_content = !parse(&s.doc, &text).same_content(&s.doc);
+            (text, loses_content)
+        }
+    };
+    let block = if s.sel.focus.story == StoryRef::Body { s.sel.focus.path.0.first().copied().unwrap_or(0) as usize } else { 0 };
+    let caret = line_start_char(&text, line_of_block(&text, block));
     s.md_source = Some(MdSource {
         caret,
         place_caret: true,
@@ -179,6 +237,7 @@ pub fn apply(s: &mut Session) {
     s.math = None;
     s.touch();
     s.clamp_selection();
+    s.md_file.latest = Some(text.clone());
     if let Some(src) = s.md_source.as_mut() {
         src.applied = text;
         src.has_step = true;
@@ -196,16 +255,25 @@ fn parse(current: &Document, text: &str) -> Document {
     doc
 }
 
-/// The line of `text` that the document's top-level block `block` starts on: its text is what
-/// comes after the blocks before it.
-fn line_of_block(doc: &Document, block: usize, story: StoryRef) -> usize {
-    if block == 0 || story != StoryRef::Body {
+/// The line of `text` that top-level block `block` starts on: the first line that, read with the
+/// lines before it, makes more blocks than that. Found by halving, as the count only grows.
+fn line_of_block(text: &str, block: usize) -> usize {
+    if block == 0 {
         return 0;
     }
-    let mut before = doc.clone();
-    before.body.truncate(block);
-    // A blank line separates the blocks.
-    wordcraft_formats::markdown::export(&before).lines().count().saturating_add(1)
+    let ends: Vec<usize> = text.match_indices('\n').map(|(i, _)| i.saturating_add(1)).chain(std::iter::once(text.len())).collect();
+    let (mut lo, mut hi) = (0, ends.len().saturating_sub(1));
+    while lo < hi {
+        let mid = lo + (hi - lo) / 2;
+        let end = ends.get(mid).copied().unwrap_or(text.len());
+        let blocks = wordcraft_formats::markdown::import(text.get(..end).unwrap_or(text)).body.len();
+        if blocks > block {
+            hi = mid;
+        } else {
+            lo = mid.saturating_add(1);
+        }
+    }
+    lo
 }
 
 /// The character where `line` starts, or the end of a text with fewer lines.
@@ -474,6 +542,141 @@ mod tests {
         assert!(s.md_source.is_none(), "the other document has no text open");
         s.activate(first).unwrap();
         assert_eq!(s.md_source.as_ref().unwrap().text, "# Mine\n");
+    }
+
+    /// What the document can't hold, all of which a save without formatted edits keeps.
+    const OWN: &str = "---\ntitle: Notes\n---\n\nTitle\n=====\n\n<!-- a comment -->\n\n* star bullet\n* another\n\n- [ ] a task\n- [x] done\n\n```bash\necho hi\n```\n\nSome *emphasis* and a [link](https://example.com \"its title\").\nA wrapped\nline.\n\n![a picture](pic.png)\n\nLast paragraph.\n";
+
+    /// A scratch folder holding `name` with `text`, opened in a new session.
+    fn open_file(dir: &str, name: &str, text: &[u8]) -> (Session, PathBuf) {
+        let dir = std::env::temp_dir().join(format!("wordcraft-md-own-{dir}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join(name);
+        std::fs::write(&path, text).unwrap();
+        let mut s = Session::new(Document::from_text(""));
+        s.run("file.open", &json!({"path": path.to_string_lossy()})).unwrap();
+        (s, path)
+    }
+
+    fn save(s: &mut Session) -> Value {
+        s.run("file.save", &json!({})).unwrap()
+    }
+
+    fn done(path: &std::path::Path) {
+        let _ = std::fs::remove_dir_all(path.parent().unwrap());
+    }
+
+    #[test]
+    fn a_file_saved_without_edits_is_written_back_byte_for_byte() {
+        for (dir, text) in [("plain", OWN.to_string()), ("crlf", OWN.replace('\n', "\r\n"))] {
+            let (mut s, path) = open_file(dir, "own.md", text.as_bytes());
+            assert_eq!(save(&mut s)["rewritten"], false, "{dir}");
+            assert_eq!(std::fs::read_to_string(&path).unwrap(), text, "{dir}");
+            done(&path);
+        }
+    }
+
+    #[test]
+    fn the_view_shows_the_files_own_text() {
+        let (mut s, path) = open_file("view", "own.md", OWN.as_bytes());
+        s.run(TOGGLE, &json!({})).unwrap();
+        let src = s.md_source.as_ref().unwrap();
+        assert_eq!(src.text, OWN);
+        assert!(!src.loses_content);
+        done(&path);
+    }
+
+    #[test]
+    fn edits_in_the_view_are_saved_as_typed() {
+        let (mut s, path) = open_file("typed", "own.md", OWN.as_bytes());
+        s.run(TOGGLE, &json!({})).unwrap();
+        let typed = OWN.replace("Last paragraph.", "<!-- another -->\n\n* Last *changed* paragraph.");
+        set_text(&mut s, &typed);
+        s.run(TOGGLE, &json!({})).unwrap();
+        assert_eq!(save(&mut s)["rewritten"], false);
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), typed);
+        // Saved while the view is open: the same.
+        s.run(TOGGLE, &json!({})).unwrap();
+        let again = typed.replace("another", "a third");
+        set_text(&mut s, &again);
+        assert_eq!(save(&mut s)["rewritten"], false);
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), again);
+        done(&path);
+    }
+
+    #[test]
+    fn an_edit_in_the_formatted_view_writes_the_document_out_again_once_with_a_warning() {
+        let (mut s, path) = open_file("formatted", "own.md", OWN.as_bytes());
+        s.run("text.insert", &json!({"text": "New "})).unwrap();
+        assert_eq!(save(&mut s)["rewritten"], true);
+        let written = std::fs::read_to_string(&path).unwrap();
+        assert!(written.contains("New "), "{written}");
+        assert!(!written.contains("<!-- a comment -->"), "written out again: {written}");
+        s.run("text.insert", &json!({"text": "Again "})).unwrap();
+        assert_eq!(save(&mut s)["rewritten"], false, "warned once: the file holds the document's own text now");
+        done(&path);
+    }
+
+    #[test]
+    fn undoing_back_to_a_kept_text_finds_it_again() {
+        // A formatted edit undone.
+        let (mut s, path) = open_file("undo", "own.md", OWN.as_bytes());
+        s.run("text.insert", &json!({"text": "New "})).unwrap();
+        s.run("edit.undo", &json!({})).unwrap();
+        assert_eq!(save(&mut s)["rewritten"], false);
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), OWN);
+
+        // A visit to the view undone: back to the opened text, then redone: the typed one.
+        s.run(TOGGLE, &json!({})).unwrap();
+        let typed = OWN.replace("Last paragraph.", "Typed paragraph.");
+        set_text(&mut s, &typed);
+        s.run(TOGGLE, &json!({})).unwrap();
+        s.run("edit.undo", &json!({})).unwrap();
+        save(&mut s);
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), OWN);
+        s.run("edit.redo", &json!({})).unwrap();
+        assert_eq!(save(&mut s)["rewritten"], true, "the typed text was given up for the saved one");
+        assert!(std::fs::read_to_string(&path).unwrap().contains("Typed paragraph."));
+        done(&path);
+    }
+
+    #[test]
+    fn files_that_cannot_go_back_as_they_were_are_written_out_without_a_warning() {
+        let bom = [b"\xEF\xBB\xBF".as_slice(), OWN.as_bytes()].concat();
+        let latin1 = b"Caf\xE9 au lait.\n".to_vec();
+        for (dir, bytes) in [("bom", bom), ("latin1", latin1), ("empty", Vec::new())] {
+            let (mut s, path) = open_file(dir, "own.md", &bytes);
+            assert!(s.md_file.is_empty(), "{dir}");
+            s.run("text.insert", &json!({"text": "New "})).unwrap();
+            assert_eq!(save(&mut s)["rewritten"], false, "{dir}");
+            done(&path);
+        }
+        // A Word document saved as Markdown is a copy written out as always.
+        let mut s = Session::new(Document::from_text("Hello"));
+        let dir = std::env::temp_dir().join(format!("wordcraft-md-own-docx-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        s.path = Some(dir.join("a.docx"));
+        let r = s.run("file.saveAs", &json!({"path": dir.join("a.md").to_string_lossy()})).unwrap();
+        assert_eq!(r["rewritten"], false);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn the_caret_finds_its_line_in_the_files_own_text() {
+        let (mut s, path) = open_file("caret", "own.md", OWN.as_bytes());
+        let target = s
+            .doc
+            .para_paths(StoryRef::Body)
+            .into_iter()
+            .find(|path| s.doc.para(StoryRef::Body, path).is_some_and(|para| para.plain_text().contains("Last")))
+            .unwrap();
+        s.sel = Selection::caret(Pos { story: StoryRef::Body, path: target, off: 0 });
+        s.run(TOGGLE, &json!({})).unwrap();
+        let src = s.md_source.as_ref().unwrap();
+        let line: String = src.text.chars().skip(src.caret).take_while(|c| *c != '\n').collect();
+        assert_eq!(line, "Last paragraph.");
+        done(&path);
     }
 
     #[test]

@@ -30,7 +30,7 @@ pub fn show(app: &mut WordApp, ui: &mut Ui) {
             src.applied_at_ms = now;
         }
     }
-    let id = ui.scope_id().with(("md_source", app.session.document_id()));
+    let id = box_id(app.session.document_id());
     let Some(src) = app.session.md_source.as_mut() else { return };
     if src.loses_content {
         egui::Frame::NONE.fill(t.hover).inner_margin(egui::Margin::symmetric(12, 6)).show(ui, |ui| {
@@ -68,6 +68,49 @@ pub fn show(app: &mut WordApp, ui: &mut Ui) {
         app.session.dirty = true;
         ui.ctx().request_repaint_after(std::time::Duration::from_secs_f64(APPLY_EVERY_MS / 1000.0));
     }
+}
+
+/// The text box of a document's pane, found the same way by Undo and Redo as by the pane.
+fn box_id(document: u64) -> egui::Id {
+    egui::Id::unique("md_source").with(document)
+}
+
+/// A text box's state for its typing history: the selection and the text.
+type Typed = (CCursorRange, String);
+
+/// The text box's typing history, with the state Undo and Redo start from.
+fn history(app: &WordApp) -> Option<(egui::Context, egui::text_edit::TextEditState, egui::util::undoer::Undoer<Typed>, Typed)> {
+    let ctx = app.ctx.clone()?;
+    let src = app.session.md_source.as_ref()?;
+    let state = egui::text_edit::TextEditState::load(&ctx, box_id(app.session.document_id()))?;
+    let undoer = state.undoer();
+    let range = state.cursor.char_range().unwrap_or(CCursorRange::one(CCursor::new(src.caret)));
+    Some((ctx, state, undoer, (range, src.text.clone())))
+}
+
+/// Whether the pane's Undo (or Redo, with `redo`) has a step to take.
+pub fn can_undo(app: &WordApp, redo: bool) -> bool {
+    history(app).is_some_and(|(_, _, undoer, now)| if redo { undoer.has_redo(&now) } else { undoer.has_undo(&now) })
+}
+
+/// Undo (or Redo, with `redo`) typing in the pane, as Ctrl+Z (Ctrl+Y) does in it: the toolbar's
+/// arrows and the Undo and Redo commands work on the text while it is open, not on the document.
+pub fn undo(app: &mut WordApp, redo: bool) -> Result<serde_json::Value, String> {
+    let Some((ctx, mut state, mut undoer, now)) = history(app) else { return Err(tl!("Nothing to undo").into()) };
+    let step = if redo { undoer.redo(&now) } else { undoer.undo(&now) }.cloned();
+    let Some((range, text)) = step else {
+        return Err(if redo { tl!("Nothing to redo") } else { tl!("Nothing to undo") }.into());
+    };
+    state.cursor.set_char_range(Some(range));
+    state.set_undoer(undoer);
+    state.store(&ctx, box_id(app.session.document_id()));
+    if let Some(src) = app.session.md_source.as_mut() {
+        src.text = text;
+        src.caret = range.primary.index.into();
+    }
+    app.session.dirty = true;
+    ctx.request_repaint();
+    Ok(json!({"text": true}))
 }
 
 #[cfg(test)]
@@ -123,6 +166,42 @@ mod tests {
         assert!(saved.contains("Typed."), "{saved}");
         assert!(!h.state().session.dirty);
         assert!(h.state().session.md_source.is_some(), "saving keeps the pane");
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn the_arrows_undo_and_redo_typing_in_the_pane() {
+        let (mut a, dir) = opened("arrows");
+        a.run("view.markdownSource", json!({})).unwrap();
+        let mut h = harness(a);
+        h.run();
+        assert!(!crate::chrome::qat_enabled(h.state(), "edit.undo"), "nothing typed yet");
+        h.event(egui::Event::Text("Typed. ".into()));
+        h.run();
+        let typed = h.state().session.md_source.as_ref().unwrap().text.clone();
+        assert!(typed.contains("Typed. "), "{typed}");
+        assert!(crate::chrome::qat_enabled(h.state(), "edit.undo"));
+        h.state_mut().run("edit.undo", json!({})).unwrap();
+        h.run();
+        assert_eq!(h.state().session.md_source.as_ref().unwrap().text, "# Heading\n\nSome text.\n", "Undo takes the typing back");
+        assert!(h.state().session.md_source.is_some(), "and stays in the pane");
+        assert!(crate::chrome::qat_enabled(h.state(), "edit.redo"));
+        h.state_mut().run("edit.redo", json!({})).unwrap();
+        h.run();
+        assert_eq!(h.state().session.md_source.as_ref().unwrap().text, typed, "Redo puts it back");
+        assert!(h.state_mut().run("edit.redo", json!({})).is_err(), "nothing more to redo");
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn the_rewrite_warning_stays_longer_than_other_messages() {
+        let (mut a, dir) = opened("warning");
+        a.run("text.insert", json!({"text": "Formatted edit. "})).unwrap();
+        a.run("file.save", json!({})).unwrap();
+        let (msg, at) = a.status_msg.clone().unwrap();
+        assert!(msg.contains("writing the Markdown out again"), "{msg}");
+        let left = at + crate::app::STATUS_MS - now_ms();
+        assert!(left > 15_000.0, "shown for about 20 seconds, {left} ms left");
         std::fs::remove_dir_all(&dir).unwrap();
     }
 

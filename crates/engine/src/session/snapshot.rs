@@ -8,6 +8,7 @@ impl Session {
         self.autocap = None;
         let replaced = self.document_id;
         self.md_source = None;
+        self.md_file = Default::default();
         self.document_id = next_document_id();
         if let Some(at) = self.order.iter_mut().find(|d| **d == replaced) {
             *at = self.document_id;
@@ -109,6 +110,7 @@ impl Session {
             typing: _,
             originals: _,
             md_source: _,
+            md_file: _,
             picture_looks: _,
             last_command: _,
             recording: _,

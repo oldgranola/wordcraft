@@ -284,6 +284,12 @@ fn open(s: &mut Session, v: &Value) -> CmdResult {
         super::view::restore_zoom(s, z);
     }
     s.path = Some(path.into());
+    // A Markdown file's own text, for the view to show and Save to write back as it is.
+    #[cfg(not(target_arch = "wasm32"))]
+    if p::str(v, "data").is_none() && super::md_source::is_markdown_file(std::path::Path::new(path)) {
+        let max = u64::try_from(super::md_source::MAX_SOURCE_BYTES).unwrap_or(u64::MAX).saturating_add(1);
+        s.md_file = crate::io::read_file_head(path, max).map(|bytes| super::md_source::FileText::from_bytes(&bytes)).unwrap_or_default();
+    }
     // Like Word, a document opened with a password is saved with it again.
     if encrypted {
         s.password = password.map(crate::io::Password::new);
@@ -372,7 +378,15 @@ fn save(s: &mut Session, v: &Value) -> CmdResult {
     let password = s.password.as_ref().map(crate::io::Password::as_str);
     // A header/footer just made and left empty isn't saved (#960).
     let copy = super::insert::saved_copy(s);
-    if let Err(e) = crate::io::save_path_with(&path, copy.as_ref().unwrap_or(&s.doc), password, &opts) {
+    // A Markdown file's own text goes back as it is while it still says what the document holds;
+    // once it doesn't (an edit in the formatted view), the document is written out again.
+    let exact = super::md_source::text_to_save(s, &path, opts.markup);
+    let rewritten = exact.is_none() && !s.md_file.is_empty() && super::md_source::is_markdown_file(&path);
+    let written = match &exact {
+        Some(text) => crate::io::save_text_path(&path, text),
+        None => crate::io::save_path_with(&path, copy.as_ref().unwrap_or(&s.doc), password, &opts),
+    };
+    if let Err(e) = written {
         (s.doc.settings.zoom, s.doc.core.last_modified_by, s.doc.core.created, s.doc.core.modified, s.doc.core.revision) = before_stamp;
         return Err(CmdError::Failed(e));
     }
@@ -386,8 +400,10 @@ fn save(s: &mut Session, v: &Value) -> CmdResult {
         s.path = Some(path.clone());
         s.dirty = false;
         s.relayout();
+        // What the file holds now.
+        s.md_file = super::md_source::FileText::saved(exact.filter(|_| super::md_source::is_markdown_file(&path)));
     }
-    Ok(json!({"saved": true, "path": path.to_string_lossy(), "encrypted": encrypted}))
+    Ok(json!({"saved": true, "path": path.to_string_lossy(), "encrypted": encrypted, "rewritten": rewritten}))
 }
 
 /// Does `path` hold a Word 2003 XML Document already (so a plain save keeps that format)?
